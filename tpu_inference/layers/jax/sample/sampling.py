@@ -459,10 +459,8 @@ def gather_logprobs(
                     with (num tokens) elements
         num_logprobs: minimum number of logprobs to
                     retain per token
-        mesh: optional device mesh. When it is provided the returned
-                    tensors are constrained to be fully replicated over
-                    it, so that a single host can fetch them in a
-                    multi-controller (multi-host) setup.
+        mesh: if given, the outputs are replicated over it so each
+                    host can fetch them (see below)
 
 
     Returns:
@@ -487,14 +485,9 @@ def gather_logprobs(
     # Use int32 to reduce the tensor size.
     indices = jnp.int32(indices)
 
-    # Replicate the results so that in a multi-controller jax setup
-    # (i.e. Ray based multi-host setup), we won't hit error like
-    # RuntimeError: Fetching value for `jax.Array` that spans non-addressable
-    # (non process local) devices is not possible.
-    # Without this the tensors inherit the `attn_data` (DP) sharding of
-    # `logprobs`, which spans devices owned by the other host, and the
-    # host-side jax.device_get() in the runner fails. This mirrors what
-    # sample() already does for `next_tokens`.
+    # The outputs otherwise inherit the DP sharding of `logprobs`, and a
+    # multi-host jax.device_get() can only fetch fully replicated arrays.
+    # Same as sample() does for `next_tokens`.
     if mesh is not None:
         replicated = NamedSharding(mesh, P())
         indices = jax.lax.with_sharding_constraint(indices, replicated)

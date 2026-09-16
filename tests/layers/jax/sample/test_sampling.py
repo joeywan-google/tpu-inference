@@ -16,6 +16,7 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from jax.experimental import mesh_utils
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
@@ -24,9 +25,10 @@ from vllm.v1.outputs import LogprobsTensors
 from tpu_inference.layers.common.sharding import ShardingAxisName
 from tpu_inference.layers.jax.sample.sampling import (
     PromptLogprobsAsyncData, PromptLogprobsReqSnap, _apply_sampling_transforms,
-    _can_sample_distributed, _merge_topk_candidates, compute_logprobs,
-    compute_prompt_logprobs, distributed_sampling_allowed, gather_logprobs,
-    sample)
+    _can_sample_distributed, _merge_topk_candidates,
+    compute_and_gather_logprobs, compute_and_gather_prompt_logprobs,
+    compute_logprobs, compute_prompt_logprobs, distributed_sampling_allowed,
+    gather_logprobs, sample)
 from tpu_inference.layers.jax.sample.sampling_metadata import \
     TPUSupportedSamplingMetadata
 
@@ -252,34 +254,40 @@ class TestProcessedLogprobs:
         device_mesh = mesh_utils.create_device_mesh(mesh_shape, devices)
         return Mesh(device_mesh, axis_names)
 
-    def test_gather_logprobs_replicated_with_mesh(self):
-        """Passing a mesh replicates the outputs without changing them."""
+    @pytest.mark.parametrize("fn", [
+        gather_logprobs,
+        compute_and_gather_logprobs,
+        compute_and_gather_prompt_logprobs,
+    ])
+    def test_logprobs_replicated_with_mesh(self, fn):
+        """A mesh replicates every output without changing the values.
+
+        Without it the outputs keep the DP sharding of the inputs, which a
+        multi-host jax.device_get() cannot fetch.
+        """
         mesh = self._get_fake_mesh()
         num_tokens = 2 * len(jax.devices())
         vocab_size = 8
-        logits = jnp.arange(num_tokens * vocab_size,
-                            dtype=jnp.float32).reshape(num_tokens, vocab_size)
-        logprobs = jax.device_put(
-            compute_logprobs(logits),
+        # gather_logprobs reads these as logprobs; only the sharding matters.
+        logits = jax.device_put(
+            jnp.arange(num_tokens * vocab_size,
+                       dtype=jnp.float32).reshape(num_tokens, vocab_size),
             NamedSharding(mesh, P(ShardingAxisName.ATTN_DATA, None)))
         token_ids = jax.device_put(
             jnp.zeros((num_tokens, ), dtype=jnp.int32),
             NamedSharding(mesh, P(ShardingAxisName.ATTN_DATA)))
+        jitted = jax.jit(fn, static_argnums=(2, 3))
 
-        unconstrained = jax.jit(lambda lp, ids: gather_logprobs(lp, ids, 2))(
-            logprobs, token_ids)
-        replicated = jax.jit(
-            lambda lp, ids: gather_logprobs(lp, ids, 2, mesh))(logprobs,
-                                                               token_ids)
+        unconstrained = jitted(logits, token_ids, 2, None)
+        replicated = jitted(logits, token_ids, 2, mesh)
 
-        assert replicated.logprob_token_ids.sharding.is_fully_replicated
-        assert replicated.logprobs.sharding.is_fully_replicated
-        assert replicated.selected_token_ranks.sharding.is_fully_replicated
-        assert np.array_equal(replicated.logprob_token_ids,
-                              unconstrained.logprob_token_ids)
-        assert np.allclose(replicated.logprobs, unconstrained.logprobs)
-        assert np.array_equal(replicated.selected_token_ranks,
-                              unconstrained.selected_token_ranks)
+        for name in ("logprob_token_ids", "logprobs", "selected_token_ranks"):
+            got = getattr(replicated, name)
+            want = getattr(unconstrained, name)
+            if len(jax.devices()) > 1:
+                assert not want.sharding.is_fully_replicated, name
+            assert got.sharding.is_fully_replicated, name
+            assert np.allclose(np.asarray(got), np.asarray(want)), name
 
     def test_processed_logprobs_with_temperature(self):
         """Temperature scaling should change the logprobs distribution."""
@@ -403,10 +411,12 @@ class TestComputePromptLogprobs:
             req_ids_dp=req_ids_dp,
             dp_size=dp_size,
             max_logprobs=2,
+            mesh=TestProcessedLogprobs._get_fake_mesh(),
         )
 
         assert res is not None
         assert isinstance(res, PromptLogprobsAsyncData)
+        assert res.tensors.logprobs.sharding.is_fully_replicated
         assert len(res.req_snaps) == 1
         snap = res.req_snaps[0]
         assert isinstance(snap, PromptLogprobsReqSnap)
